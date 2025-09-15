@@ -1,130 +1,127 @@
 import express from "express";
+import { createServer } from "http";
+import { Server } from "socket.io";
 import fs from "fs";
-import path from "path";
-import { PdfReader } from "pdfreader";
-import { pipeline } from "@xenova/transformers";
+import pdfParse from "pdf-parse";
+import { fileURLToPath } from "url";
 
 const app = express();
-app.use(express.json());
+const server = createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
 
-const dataDir = path.join(process.cwd(), "pdf_data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir);
+let step = 0;
+let fileJson = null;
+
+// Normalize path (for Windows + file://)
+function normalizePath(inputPath) {
+  if (inputPath.startsWith("file:///")) {
+    return fileURLToPath(inputPath);
+  }
+  return inputPath;
 }
 
-// ------------------- Embedding Setup -------------------
-let embedder;
-const getEmbedder = async () => {
-  if (!embedder) {
-    console.log("⏳ Loading embedding model...");
-    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-    console.log("✅ Embedding model loaded!");
+// Check if line looks like a "heading"
+function isHeading(line) {
+  if (!line) return false;
+  if (line.includes(":")) return false;
+  // Heading is short (<5 words) and starts with uppercase
+  return /^[A-Z][A-Za-z ]{1,50}$/.test(line.trim());
+}
+
+// PDF → JSON (headings as keys, values as values)
+function parsePdfToJson(text) {
+  const jsonData = {};
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l);
+
+  let currentKey = null;
+  let buffer = [];
+
+  for (let line of lines) {
+    if (isHeading(line)) {
+      if (currentKey) {
+        jsonData[currentKey] = buffer.join("\n").trim();
+      }
+      currentKey = line;
+      buffer = [];
+    } else {
+      if (line.includes(":")) {
+        // Explicit key:value
+        const [key, value] = line.split(":");
+        jsonData[key.trim()] = value.trim();
+      } else {
+        buffer.push(line);
+      }
+    }
   }
-  return embedder;
-};
 
-const getEmbedding = async (text) => {
-  const model = await getEmbedder();
-  const output = await model(text, { pooling: "mean", normalize: true });
-  return Array.from(output.data);
-};
-
-// ------------------- Cosine Similarity -------------------
-const cosineSimilarity = (vecA, vecB) => {
-  const dot = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-  const normA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-  const normB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
-  return dot / (normA * normB);
-};
-
-// ------------------- API: Extract PDF -------------------
-app.post("/extractPdf", (req, res) => {
-  const { filePath } = req.body;
-  if (!filePath) {
-    return res.status(400).json({ error: "filePath is required" });
+  if (currentKey) {
+    jsonData[currentKey] = buffer.join("\n").trim();
   }
 
-  fs.readFile(filePath, (err, pdfBuffer) => {
-    if (err) return res.status(500).json({ error: "Error reading file" });
+  return jsonData;
+}
 
-    let rawText = [];
+io.on("connection", (socket) => {
+  console.log("✅ User connected");
 
-    new PdfReader().parseBuffer(pdfBuffer, async (err, item) => {
-      if (err) {
-        console.error("PDF parsing error:", err);
-        return res.status(500).json({ error: "Failed to parse PDF" });
-      } else if (!item) {
-        // Parsing finished → join lines into full text
-        const fullText = rawText.join(" ").replace(/\s+/g, " ").trim();
+  socket.on("sendMessage", async (msg) => {
+    console.log("📩 Message:", msg);
 
-        // Split into paragraphs by double newline OR period + capital letter
-        const paragraphs = fullText
-          .split(/(\. |\n\n)/)
-          .map((p) => p.trim())
-          .filter((p) => p.length > 50); // ignore too-short chunks
+    try {
+      if (msg.toLowerCase() === "new") {
+        step = 0;
+        fileJson = null;
+        socket.emit("receiveMessage", "🆕 New chat started. Type 'hi' to begin.");
+        return;
+      }
 
-        let documents = [];
-        for (let i = 0; i < paragraphs.length; i++) {
-          const text = paragraphs[i];
-          const embedding = await getEmbedding(text);
-          documents.push({ id: i + 1, text, embedding });
+      if (step === 0 && msg.toLowerCase() === "hi") {
+        step = 1;
+        socket.emit("receiveMessage", "👋 Please enter the PDF file path:");
+      } else if (step === 1) {
+        const filePath = normalizePath(msg);
+
+        if (fs.existsSync(filePath)) {
+          const pdfBuffer = fs.readFileSync(filePath);
+          const data = await pdfParse(pdfBuffer);
+
+          fileJson = parsePdfToJson(data.text);
+          step = 2;
+
+          socket.emit("receiveMessage", `✅ File loaded! Extracted sections: ${Object.keys(fileJson).join(", ")}. Ask me about them.`);
+        } else {
+          socket.emit("receiveMessage", "❌ File not found. Please try again.");
+        }
+      } else if (step === 2) {
+        if (!fileJson) {
+          socket.emit("receiveMessage", "❌ No file loaded. Type 'hi' to start.");
+          return;
         }
 
-        const fileName = `pdf_${Date.now()}.json`;
-        const jsonFilePath = path.join(dataDir, fileName);
+        const lowerQ = msg.toLowerCase();
+        let answer = null;
 
-        await fs.promises.writeFile(
-          jsonFilePath,
-          JSON.stringify(documents, null, 2)
+        const foundKey = Object.keys(fileJson).find(k =>
+          lowerQ.includes(k.toLowerCase())
         );
 
-        console.log("✅ PDF saved at:", jsonFilePath);
-        return res.json({
-          message: "PDF extracted and embedded successfully",
-          fileId: fileName,
-          paragraphs: documents.length,
-        });
-      } else if (item.text) {
-        rawText.push(item.text.trim());
+        if (foundKey) {
+          answer = fileJson[foundKey];
+        }
+
+        if (answer) {
+          socket.emit("receiveMessage", `📖 ${answer}`);
+        } else {
+          socket.emit("receiveMessage", "❌ Sorry, I couldn’t find that info in the PDF.");
+        }
       }
-    });
+    } catch (err) {
+      console.error("❌ Error:", err);
+      socket.emit("receiveMessage", "⚠️ Error: " + err.message);
+    }
   });
 });
 
-// ------------------- API: Ask Question -------------------
-app.post("/ask", async (req, res) => {
-  const { fileId, question } = req.body;
-
-  if (!fileId || !question) {
-    return res.status(400).json({ error: "fileId and question are required" });
-  }
-
-  const filePath = path.join(dataDir, fileId);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  try {
-    const documents = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
-    const queryEmbedding = await getEmbedding(question);
-
-    const ranked = documents
-      .map((doc) => ({
-        id: doc.id,
-        text: doc.text,
-        score: cosineSimilarity(queryEmbedding, doc.embedding),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    const top = ranked.slice(0, 3); // top 3 matches
-    res.json({ answer: top });
-  } catch (err) {
-    console.error("Error in ask API:", err);
-    return res.status(500).json({ error: "Error processing your request" });
-  }
-});
-
-// ------------------- Start Server -------------------
-app.listen(5000, () => {
+server.listen(5000, () => {
   console.log("🚀 Server running on http://localhost:5000");
 });
